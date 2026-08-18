@@ -17,6 +17,19 @@
 - On Windows, the equivalents are `%LOCALAPPDATA%\\jcode\\bin\\jcode.exe` for the launcher, `%LOCALAPPDATA%\\jcode\\builds\\stable\\jcode.exe` for stable, and `%LOCALAPPDATA%\\jcode\\builds\\versions\\<version>\\jcode.exe` for immutable installs; `scripts/install.ps1` currently installs the stable channel.
 - Ensure `~/.local/bin` is **before** `~/.cargo/bin` in `PATH`.
 
+## Local Cargo verification
+
+Use `scripts/dev_cargo.sh` (or its `scripts/cargo_exec.sh` pass-through)
+instead of raw `cargo` for build/test/check work: it adaptively sizes
+`CARGO_BUILD_JOBS` from available memory instead of the repo's static
+`jobs = 4` fallback, and picks a fast linker automatically. Verify in stages
+(focused change tests → affected crate/package → broad guardrail via
+`scripts/check_guardrails.sh` → full/`--all-features` only when the issue
+contract or a concrete risk requires it), batch overlapping checks instead of
+repeating them, and pull coarse timing from `~/.jcode/logs/rust-actions.jsonl`
+when a task is build-heavy. See `docs/DEV_VERIFICATION_WORKFLOW.md` for the
+full staged workflow.
+
 ## Verifying a change at runtime
 
 `cargo build` alone proves nothing about behavior. `jcode run` and interactive
