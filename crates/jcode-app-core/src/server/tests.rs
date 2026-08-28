@@ -1120,3 +1120,122 @@ async fn has_working_headless_members_detects_a_live_worker() {
         "the daemon may exit once every worker reached a terminal state"
     );
 }
+
+/// End-to-end over the REAL spawn path: a worker created by
+/// `create_headless_session` and driven by the REAL `update_member_status`
+/// must hold the daemon open while it works, and release it when it finishes.
+///
+/// The unit tests above build a `SwarmMember` by hand, which cannot prove that
+/// a genuinely spawned worker is registered with the `is_headless` flag and the
+/// statuses this check depends on. This exercises the production functions so a
+/// change to how workers register, or to the status vocabulary they move
+/// through, fails here instead of silently reintroducing the worker-kill.
+#[tokio::test]
+async fn spawned_headless_worker_holds_daemon_open_until_it_finishes() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("JCODE_HOME", temp.path());
+    let _runtime = ScopedEnvVar::set("JCODE_RUNTIME_DIR", temp.path());
+
+    let provider: Arc<dyn Provider> = Arc::new(StreamingMockProvider::default());
+    let sessions: super::SessionAgents = Arc::new(RwLock::new(HashMap::new()));
+    let global_session_id = Arc::new(RwLock::new("session-root".to_string()));
+    let members: Arc<RwLock<HashMap<String, SwarmMember>>> = Arc::new(RwLock::new(HashMap::new()));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::new()));
+    let coordinators = Arc::new(RwLock::new(HashMap::new()));
+    let plans = Arc::new(RwLock::new(HashMap::new()));
+    let queues: SessionInterruptQueues = Arc::new(RwLock::new(HashMap::new()));
+
+    // Nothing spawned yet: the daemon is genuinely idle and may exit.
+    assert!(
+        !super::has_working_headless_members(&members).await,
+        "a daemon with no workers must remain eligible for idle exit"
+    );
+
+    // Spawn through the real production path.
+    let created = super::headless::create_headless_session(
+        &sessions,
+        &global_session_id,
+        &provider,
+        "create_session",
+        &members,
+        &swarms_by_id,
+        &coordinators,
+        &plans,
+        &queues,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        super::headless::HeadlessMemoryScope::IsolatedTest,
+    )
+    .await
+    .expect("headless spawn should succeed");
+
+    let worker_id = serde_json::from_str::<serde_json::Value>(&created)
+        .expect("spawn result is json")
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .expect("spawn result carries a session id")
+        .to_string();
+
+    // A freshly spawned worker really is registered as headless. If this ever
+    // regresses, the whole idle-exit guard silently stops applying.
+    assert!(
+        members
+            .read()
+            .await
+            .get(&worker_id)
+            .expect("spawned worker is a swarm member")
+            .is_headless,
+        "a spawned swarm worker must be registered as headless"
+    );
+
+    // Freshly spawned and idle: not yet a reason to keep the daemon alive.
+    assert!(
+        !super::has_working_headless_members(&members).await,
+        "an idle spawned worker must not hold the daemon open"
+    );
+
+    // Now the worker starts a turn, via the real status-update path. This is
+    // the exact transition seen in production logs (ready -> running).
+    super::update_member_status(
+        &worker_id,
+        "running",
+        Some("mid-turn".to_string()),
+        &members,
+        &swarms_by_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        super::has_working_headless_members(&members).await,
+        "a running spawned worker MUST hold the daemon open; this is the regression \
+         that killed workers mid-tool-call"
+    );
+
+    // The worker finishes. The daemon becomes eligible for idle exit again, so
+    // the fix cannot leak a daemon that never exits.
+    super::update_member_status(
+        &worker_id,
+        "completed",
+        Some("done".to_string()),
+        &members,
+        &swarms_by_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        !super::has_working_headless_members(&members).await,
+        "once the worker completes, the daemon must be eligible for idle exit again"
+    );
+}

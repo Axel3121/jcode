@@ -1795,6 +1795,7 @@ impl Server {
                 self.debug_socket_path.clone(),
                 self.identity.name.clone(),
                 policy,
+                Arc::clone(&self.swarm_state.members),
             );
         } else if debug_control_allowed() {
             crate::logging::info("Debug control enabled; idle timeout monitor disabled.");
