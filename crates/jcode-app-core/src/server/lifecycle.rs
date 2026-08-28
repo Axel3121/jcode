@@ -141,6 +141,7 @@ pub(crate) fn spawn_temporary_lifecycle_monitor(
     debug_socket_path: PathBuf,
     server_name: String,
     policy: TemporaryServerPolicy,
+    swarm_members: Arc<RwLock<std::collections::HashMap<String, super::SwarmMember>>>,
 ) {
     tokio::spawn(async move {
         let mut idle_since: Option<Instant> = None;
@@ -161,7 +162,13 @@ pub(crate) fn spawn_temporary_lifecycle_monitor(
             }
 
             let count = *client_count.read().await;
-            if count == 0 {
+            // Headless swarm workers run in-process and hold no client
+            // connection, so they must be counted as occupancy or they are
+            // killed mid-turn by idle exit.
+            let busy_with_headless_workers =
+                count == 0 && super::has_working_headless_members(&swarm_members).await;
+
+            if count == 0 && !busy_with_headless_workers {
                 if idle_since.is_none() {
                     idle_since = Some(Instant::now());
                     crate::logging::info(&format!(
@@ -181,9 +188,15 @@ pub(crate) fn spawn_temporary_lifecycle_monitor(
                 }
             } else {
                 if idle_since.is_some() {
-                    crate::logging::info(
-                        "Temporary server client connected. Idle timer cancelled.",
-                    );
+                    if busy_with_headless_workers {
+                        crate::logging::info(
+                            "Temporary server has a running headless swarm worker. Idle timer cancelled.",
+                        );
+                    } else {
+                        crate::logging::info(
+                            "Temporary server client connected. Idle timer cancelled.",
+                        );
+                    }
                 }
                 idle_since = None;
             }
