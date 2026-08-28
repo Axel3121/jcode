@@ -1038,3 +1038,85 @@ async fn startup_ready_signal_is_not_blocked_by_headless_recovery_delay() -> Res
 
     Ok(())
 }
+
+/// A headless swarm worker that is still working must keep the daemon alive.
+///
+/// Headless/inline workers run inside the daemon and never open a client
+/// connection, so they contribute nothing to `client_count`. Before this was
+/// accounted for, a coordinator that detached (or whose TUI was closed) left
+/// the daemon at zero clients while its workers were mid-turn, and the 5-minute
+/// idle monitor exited the process, killing every live worker.
+#[test]
+fn working_headless_member_blocks_idle_exit() {
+    for status in ["running", "streaming", "thinking", "queued"] {
+        assert!(
+            super::headless_member_is_working(status, true),
+            "headless worker in status {status} should block idle exit"
+        );
+    }
+}
+
+#[test]
+fn terminal_or_idle_headless_member_does_not_block_idle_exit() {
+    for status in [
+        "ready",
+        "completed",
+        "done",
+        "failed",
+        "stopped",
+        "crashed",
+        "closed",
+        "disconnected",
+    ] {
+        assert!(
+            !super::headless_member_is_working(status, true),
+            "headless worker in status {status} must not hold the daemon open"
+        );
+    }
+}
+
+#[test]
+fn attached_client_member_never_counts_as_headless_work() {
+    // Non-headless members own a client connection, which `client_count`
+    // already tracks. Counting them here would keep the daemon alive forever
+    // after a client vanished without a clean disconnect.
+    for status in ["running", "ready", "stopped"] {
+        assert!(!super::headless_member_is_working(status, false));
+    }
+}
+
+#[tokio::test]
+async fn has_working_headless_members_detects_a_live_worker() {
+    let members: Arc<RwLock<HashMap<String, SwarmMember>>> = Arc::new(RwLock::new(HashMap::new()));
+    assert!(
+        !super::has_working_headless_members(&members).await,
+        "empty swarm must not hold the daemon open"
+    );
+
+    members.write().await.insert(
+        "worker-idle".to_string(),
+        persisted_headless_member("worker-idle", "swarm-1", "ready", "idle"),
+    );
+    assert!(
+        !super::has_working_headless_members(&members).await,
+        "an idle worker must not hold the daemon open"
+    );
+
+    members.write().await.insert(
+        "worker-busy".to_string(),
+        persisted_headless_member("worker-busy", "swarm-1", "running", "mid-turn"),
+    );
+    assert!(
+        super::has_working_headless_members(&members).await,
+        "a running worker must hold the daemon open"
+    );
+
+    members.write().await.insert(
+        "worker-busy".to_string(),
+        persisted_headless_member("worker-busy", "swarm-1", "completed", "done"),
+    );
+    assert!(
+        !super::has_working_headless_members(&members).await,
+        "the daemon may exit once every worker reached a terminal state"
+    );
+}

@@ -332,6 +332,29 @@ fn headless_member_should_restore(status: &str, is_headless: bool) -> bool {
         )
 }
 
+/// Whether a swarm member is a headless worker that is still doing real work.
+///
+/// Headless/inline swarm workers run inside the daemon and have no client
+/// connection of their own, so they contribute nothing to `client_count`. A
+/// coordinator that spawns workers and then detaches (or whose TUI is closed)
+/// leaves the daemon at zero clients while those workers are mid-turn. Without
+/// this check the idle monitor exits the process and every live worker dies
+/// silently in the middle of a tool call.
+fn headless_member_is_working(status: &str, is_headless: bool) -> bool {
+    is_headless && !swarm::member_status_is_terminal(status) && status != "ready"
+}
+
+/// Whether any headless swarm worker is still running in this daemon.
+async fn has_working_headless_members(
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+) -> bool {
+    swarm_members
+        .read()
+        .await
+        .values()
+        .any(|member| headless_member_is_working(&member.status, member.is_headless))
+}
+
 fn headless_reload_continuation_message(reload_ctx: Option<ReloadContext>) -> Option<String> {
     ReloadContext::recovery_directive(reload_ctx.as_ref(), true, "", None)
         .map(|directive| directive.continuation_message)
@@ -1778,6 +1801,7 @@ impl Server {
         } else {
             let idle_client_count = Arc::clone(&self.client_count);
             let idle_server_name = self.identity.name.clone();
+            let idle_swarm_members = Arc::clone(&self.swarm_state.members);
             tokio::spawn(async move {
                 let mut idle_since: Option<std::time::Instant> = None;
                 let mut check_interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -1787,7 +1811,13 @@ impl Server {
 
                     let count = *idle_client_count.read().await;
 
-                    if count == 0 {
+                    // Headless swarm workers are live work with no client
+                    // connection. Treat them as occupancy, otherwise a detached
+                    // coordinator's workers are killed mid-turn by idle exit.
+                    let busy_with_headless_workers =
+                        count == 0 && has_working_headless_members(&idle_swarm_members).await;
+
+                    if count == 0 && !busy_with_headless_workers {
                         // No clients connected
                         if idle_since.is_none() {
                             idle_since = Some(std::time::Instant::now());
@@ -1809,9 +1839,15 @@ impl Server {
                             }
                         }
                     } else {
-                        // Clients connected - reset idle timer
+                        // Clients connected, or headless workers still running.
                         if idle_since.is_some() {
-                            crate::logging::info("Client connected. Idle timer cancelled.");
+                            if busy_with_headless_workers {
+                                crate::logging::info(
+                                    "Headless swarm worker still running. Idle timer cancelled.",
+                                );
+                            } else {
+                                crate::logging::info("Client connected. Idle timer cancelled.");
+                            }
                         }
                         idle_since = None;
                     }
